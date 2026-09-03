@@ -8,6 +8,7 @@ package starlark_test
 
 import (
 	"fmt"
+	"iter"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -153,5 +154,134 @@ func TestParamDefault(t *testing.T) {
 				t.Errorf("param defaults got diff (-want +got):\n%s", diff)
 			}
 		})
+	}
+}
+
+// A fakeMapping is a starlark.IterableMapping that deliberately does not
+// implement the Elements or Entries fast paths, so that the standalone
+// starlark.Elements and starlark.Entries functions must use the generic
+// Iterate/Done code path.
+//
+// Like *List and *Dict it counts its active iterators, but as a signed
+// integer so that the tests can observe underflow.
+type fakeMapping struct {
+	items     []starlark.Tuple
+	itercount int
+}
+
+var _ starlark.IterableMapping = (*fakeMapping)(nil)
+
+func (m *fakeMapping) String() string          { return "fakemapping" }
+func (m *fakeMapping) Type() string            { return "fakemapping" }
+func (m *fakeMapping) Freeze()                 {}
+func (m *fakeMapping) Truth() starlark.Bool    { return starlark.Bool(len(m.items) > 0) }
+func (m *fakeMapping) Hash() (uint32, error)   { return 0, fmt.Errorf("unhashable: %s", m.Type()) }
+func (m *fakeMapping) Items() []starlark.Tuple { return m.items }
+
+func (m *fakeMapping) Get(k starlark.Value) (v starlark.Value, found bool, err error) {
+	for _, item := range m.items {
+		if eq, err := starlark.Equal(item[0], k); err != nil {
+			return nil, false, err
+		} else if eq {
+			return item[1], true, nil
+		}
+	}
+	return nil, false, nil
+}
+
+func (m *fakeMapping) Iterate() starlark.Iterator {
+	m.itercount++
+	return &fakeMappingIterator{m: m}
+}
+
+type fakeMappingIterator struct {
+	m *fakeMapping
+	i int
+}
+
+func (it *fakeMappingIterator) Next(p *starlark.Value) bool {
+	if it.i == len(it.m.items) {
+		return false
+	}
+	*p = it.m.items[it.i][0]
+	it.i++
+	return true
+}
+
+func (it *fakeMappingIterator) Done() { it.m.itercount-- }
+
+func assertNoElementsFastPath(t *testing.T, v any) {
+	t.Helper()
+	if _, ok := v.(interface {
+		Elements() iter.Seq[starlark.Value]
+	}); ok {
+		t.Fatalf("%T has an Elements fast path, so this test would not exercise Elements' generic code path", v)
+	}
+}
+
+func assertNoEntriesFastPath(t *testing.T, v any) {
+	t.Helper()
+	if _, ok := v.(interface {
+		Entries() iter.Seq2[starlark.Value, starlark.Value]
+	}); ok {
+		t.Fatalf("%T has an Entries fast path, so this test would not exercise Entries' generic code path", v)
+	}
+}
+
+func TestElementsIteratorCount(t *testing.T) {
+	m := &fakeMapping{items: []starlark.Tuple{
+		{starlark.String("one"), starlark.MakeInt(1)},
+		{starlark.String("two"), starlark.MakeInt(2)},
+	}}
+	assertNoElementsFastPath(t, m)
+
+	// Asking for the sequence must not start an iteration.
+	seq := starlark.Elements(m)
+	if m.itercount != 0 {
+		t.Errorf("Elements(m) started an iteration: itercount = %d, want 0", m.itercount)
+	}
+
+	// Each iteration must be independent and must balance Iterate with Done.
+	want := []string{`"one"`, `"two"`}
+	for pass := range 2 {
+		var got []string
+		for elem := range seq {
+			got = append(got, fmt.Sprint(elem))
+		}
+		if diff := cmp.Diff(want, got); diff != "" {
+			t.Errorf("pass %d: Elements(m) diff (-want +got):\n%s", pass, diff)
+		}
+		if m.itercount != 0 {
+			t.Errorf("pass %d: unbalanced Iterate/Done: itercount = %d, want 0", pass, m.itercount)
+		}
+	}
+}
+
+func TestEntriesIteratorCount(t *testing.T) {
+	m := &fakeMapping{items: []starlark.Tuple{
+		{starlark.String("one"), starlark.MakeInt(1)},
+		{starlark.String("two"), starlark.MakeInt(2)},
+	}}
+	assertNoEntriesFastPath(t, m)
+
+	// Asking for the sequence must not start an iteration.
+	seq := starlark.Entries(m)
+	if m.itercount != 0 {
+		t.Errorf("Entries(m) started an iteration: itercount = %d, want 0", m.itercount)
+	}
+
+	// Each iteration must be independent and must balance Iterate with Done.
+	want := []string{`"one" 1`, `"two" 2`}
+	for pass := range 2 {
+		var got []string
+		for k, v := range seq {
+			got = append(got, fmt.Sprintf("%v %v", k, v))
+		}
+		if diff := cmp.Diff(want, got); diff != "" {
+			t.Errorf("pass %d: Entries(m) diff (-want +got):\n%s", pass, diff)
+		}
+		if m.itercount != 0 {
+			t.Errorf("pass %d: unbalanced Iterate/Done: itercount = %d, want 0", pass, m.itercount)
+		}
 	}
 }
